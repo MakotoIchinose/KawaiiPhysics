@@ -33,7 +33,7 @@ https://www.youtube.com/watch?v=UvpEIBGegvs
 [次期アイドルマスター グラフィクス＆アニメーション プログラミング プレビュー](https://cedil.cesa.or.jp/cedil_sessions/view/416)
 
 ## 動作環境
-- UE4.22  
+- UE4.24.2  
 
 UE4.21以前でビルドする場合は、KawaiiPhysicsEditMode.cpp における  
 GEngine->ConstraintLimitMaterialPrismatic->GetRenderProxy () を  
@@ -64,6 +64,25 @@ MIT
 [#KawaiiPhysics](https://twitter.com/search?q=%23kawaiiphysics&src=typed_query&f=live)
 
 ## 履歴
+2019/3/13 v1.4.4  
+MacOSでビルドに失敗する不具合の修正  
+(melMass 様、ありがとうございました！)  
+2019/3/13 v1.4.3  
+Package作成に失敗する不具合を修正  
+2019/2/16 v1.4.2  
+Standalone実行時に正常に動作しない不具合を修正  
+2019/1/31 v1.4.1  
+**SphereLimitのLimitTypeがInnerの場合、Outer設定時に異なりBoneのRadius設定を考慮してなかった不具合の修正  
+1.3.1以前の挙動に戻したい方は CVarEnableOldPhysicsMethodSphereLimit を 1 に設定してください**    
+2019/1/31 v1.4.0  
+**重力変数の位置更新の計算がgt^2でなくgtになっていたので修正  
+1.3.1以前の重力計算を使用したい場合は　p.KawaiiPhysics.EnableOldPhysicsMethodGravity を 1 に設定してください**  
+2019/1/31 v1.3.1  
+TeleportRotationThresholdの計算にてラジアンと度が混在していたことでWorldRotationのテレポート対応がほぼ機能してなかった不具合を修正  
+(monguri 様、ありがとうございました！)  
+2019/1/31 v1.3.0  
+UE4.24.2 に対応  
+(TheHoodieGuy02 様、ありがとうございました！)  
 2019/10/29 v1.2.1  
 ・World Damping系を従来処理に差し戻し。30fps時の挙動が更に安定しました  
 (@seiko_dev 様、ありがとうございました！)  

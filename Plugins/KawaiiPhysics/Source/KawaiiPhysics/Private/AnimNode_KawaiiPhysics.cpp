@@ -5,6 +5,10 @@
 #include "Animation/AnimInstanceProxy.h"
 #include "Curves/CurveFloat.h"
 
+TAutoConsoleVariable<int32> CVarEnableOldPhysicsMethodGrayity(TEXT("p.KawaiiPhysics.EnableOldPhysicsMethodGravity"), 0, 
+	TEXT("Enables/Disables old physics method for gravity before v1.3.1. This is the setting for the transition period when changing the physical calculation."));
+TAutoConsoleVariable<int32> CVarEnableOldPhysicsMethodSphereLimit(TEXT("p.KawaiiPhysics.EnableOldPhysicsMethodSphereLimit"), 0,
+	TEXT("Enables/Disables old physics method for sphere limit before v1.3.1. This is the setting for the transition period when changing the physical calculation."));
 
 FAnimNode_KawaiiPhysics::FAnimNode_KawaiiPhysics()
 {
@@ -106,7 +110,7 @@ void FAnimNode_KawaiiPhysics::EvaluateSkeletalControl_AnyThread(FComponentSpaceP
 	}
 
 	SkelCompMoveRotation = ComponentTransform.InverseTransformRotation(PreSkelCompTransform.GetRotation());
-	if (SkelCompMoveRotation.GetAngle() > TeleportRotationThreshold * TeleportRotationThreshold)
+	if ( TeleportRotationThreshold >= 0 && FMath::RadiansToDegrees( SkelCompMoveRotation.GetAngle() ) > TeleportRotationThreshold )
 	{
 		SkelCompMoveRotation = FQuat::Identity;
 	}
@@ -502,8 +506,15 @@ void FAnimNode_KawaiiPhysics::SimulateModfyBones(FComponentSpacePoseContext& Out
 
 		// Gravity
 		// TODO:Migrate if there are more good method (Currently copying AnimDynamics implementation)
-		Bone.Location += Gravity * DeltaTime;
-
+		if (CVarEnableOldPhysicsMethodGrayity.GetValueOnAnyThread() == 0)
+		{
+			Bone.Location += 0.5 * Gravity * DeltaTime * DeltaTime;
+		}
+		else
+		{
+			Bone.Location += Gravity * DeltaTime;
+		}
+		
 		// Pull to Pose Location
 		FVector BaseLocation = ParentBone.Location + (BonePoseLocation - ParentBonePoseLocation);
 		Bone.Location += (BaseLocation - Bone.Location) *
@@ -561,7 +572,14 @@ void FAnimNode_KawaiiPhysics::AdjustBySphereCollision(FKawaiiPhysicsModifyBone& 
 			}
 			else
 			{
-				Bone.Location = Sphere.Location + Sphere.Radius * (Bone.Location - Sphere.Location).GetSafeNormal();
+				if (CVarEnableOldPhysicsMethodSphereLimit.GetValueOnAnyThread() == 0)
+				{
+					Bone.Location = Sphere.Location + (Sphere.Radius - Bone.PhysicsSettings.Radius) * (Bone.Location - Sphere.Location).GetSafeNormal();
+				}
+				else
+				{
+					Bone.Location = Sphere.Location + Sphere.Radius * (Bone.Location - Sphere.Location).GetSafeNormal();
+				}
 			}
 		}
 	}
