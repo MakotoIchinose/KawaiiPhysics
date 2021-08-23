@@ -4,6 +4,7 @@
 #include "AnimationRuntime.h"
 #include "Animation/AnimInstanceProxy.h"
 #include "Curves/CurveFloat.h"
+#include "KawaiiPhysicsLimitsDataAsset.h"
 
 TAutoConsoleVariable<int32> CVarEnableOldPhysicsMethodGrayity(TEXT("p.KawaiiPhysics.EnableOldPhysicsMethodGravity"), 0, 
 	TEXT("Enables/Disables old physics method for gravity before v1.3.1. This is the setting for the transition period when changing the physical calculation."));
@@ -19,12 +20,17 @@ void FAnimNode_KawaiiPhysics::Initialize_AnyThread(const FAnimationInitializeCon
 {
 	FAnimNode_SkeletalControlBase::Initialize_AnyThread(Context);
 	FBoneContainer& RequiredBones = Context.AnimInstanceProxy->GetRequiredBones();
+
+	ApplyLimitsDataAsset(RequiredBones);
+
 	InitializeBoneReferences(RequiredBones);
 
 	ModifyBones.Empty();
 
 	// For Avoiding Zero Divide in the first frame
 	DeltaTimeOld = 1.0f / TargetFramerate;
+
+	bResetDynamics = false;
 
 #if WITH_EDITOR
 	auto World = Context.AnimInstanceProxy->GetSkelMeshComponent()->GetWorld();
@@ -42,6 +48,11 @@ void FAnimNode_KawaiiPhysics::CacheBones_AnyThread(const FAnimationCacheBonesCon
 
 }
 
+void FAnimNode_KawaiiPhysics::ResetDynamics(ETeleportType InTeleportType)
+{
+	bResetDynamics |= (ETeleportType::ResetPhysics == InTeleportType);
+}
+
 void FAnimNode_KawaiiPhysics::UpdateInternal(const FAnimationUpdateContext& Context)
 {
 	FAnimNode_SkeletalControlBase::UpdateInternal(Context);
@@ -57,8 +68,22 @@ void FAnimNode_KawaiiPhysics::EvaluateSkeletalControl_AnyThread(FComponentSpaceP
 
 	check(OutBoneTransforms.Num() == 0);
 
+	if(bResetDynamics)
+	{
+		ModifyBones.Empty(ModifyBones.Num());
+		bResetDynamics = false;
+	}
+
 	const FBoneContainer& BoneContainer = Output.Pose.GetPose().GetBoneContainer();
 	FTransform ComponentTransform = Output.AnimInstanceProxy->GetComponentTransform();
+
+#if WITH_EDITOR
+	// sync editing on other Nodes
+	if (LimitsDataAsset)
+	{ 
+		ApplyLimitsDataAsset(BoneContainer);
+	}
+#endif
 
 	if (!RootBone.IsValidToEvaluate(BoneContainer))
 	{
@@ -83,9 +108,12 @@ void FAnimNode_KawaiiPhysics::EvaluateSkeletalControl_AnyThread(FComponentSpaceP
 			bInitPhysicsSettings = true;
 		}
 	}
-	UpdateSphericalLimits(Output, BoneContainer, ComponentTransform);
-	UpdateCapsuleLimits(Output, BoneContainer, ComponentTransform);
-	UpdatePlanerLimits(Output, BoneContainer, ComponentTransform);
+	UpdateSphericalLimits(SphericalLimits, Output, BoneContainer, ComponentTransform);
+	UpdateSphericalLimits(SphericalLimitsData, Output, BoneContainer, ComponentTransform);
+	UpdateCapsuleLimits(CapsuleLimits, Output, BoneContainer, ComponentTransform);
+	UpdateCapsuleLimits(CapsuleLimitsData, Output, BoneContainer, ComponentTransform);
+	UpdatePlanerLimits(PlanarLimits,Output, BoneContainer, ComponentTransform);
+	UpdatePlanerLimits(PlanarLimitsData, Output, BoneContainer, ComponentTransform);
 	for (auto& Bone : ModifyBones)
 	{
 		if (!Bone.bDummy)
@@ -95,7 +123,7 @@ void FAnimNode_KawaiiPhysics::EvaluateSkeletalControl_AnyThread(FComponentSpaceP
 		else
 		{
 			auto ParentBone = ModifyBones[Bone.ParentIndex];
-			Bone.PoseLocation = ParentBone.PoseLocation + ParentBone.PoseRotation.GetForwardVector() * DummyBoneLength;
+			Bone.PoseLocation = ParentBone.PoseLocation + GetBoneForwardVector(ParentBone.PoseRotation) * DummyBoneLength;
 			Bone.PoseRotation = ParentBone.PoseRotation;
 			Bone.PoseScale = ParentBone.PoseScale;
 		}
@@ -118,7 +146,7 @@ void FAnimNode_KawaiiPhysics::EvaluateSkeletalControl_AnyThread(FComponentSpaceP
 	PreSkelCompTransform = ComponentTransform;
 
 	// Simulate Physics and Apply
-	SimulateModfyBones(Output, BoneContainer, ComponentTransform);
+	SimulateModifyBones(Output, BoneContainer, ComponentTransform);
 	ApplySimuateResult(Output, BoneContainer, OutBoneTransforms);
 }
 
@@ -140,16 +168,15 @@ void FAnimNode_KawaiiPhysics::InitializeBoneReferences(const FBoneContainer& Req
 	{
 		Sphere.DrivingBone.Initialize(RequiredBones);
 	}
-
 	for (auto& Capsule : CapsuleLimits)
 	{
 		Capsule.DrivingBone.Initialize(RequiredBones);
 	}
-
 	for (auto& Planer : PlanarLimits)
 	{
 		Planer.DrivingBone.Initialize(RequiredBones);
 	}
+
 }
 
 DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_InitModifyBones"), STAT_KawaiiPhysics_InitModifyBones, STATGROUP_Anim);
@@ -163,7 +190,38 @@ void FAnimNode_KawaiiPhysics::InitModifyBones(FComponentSpacePoseContext& Output
 
 	ModifyBones.Empty();
 	AddModifyBone(Output, BoneContainer, RefSkeleton, RefSkeleton.FindBoneIndex(RootBone.BoneName));
-	CalcBoneLength( ModifyBones[0], RefSkeleton.GetRefBonePose());
+	if (ModifyBones.Num() > 0)
+	{
+		CalcBoneLength(ModifyBones[0], BoneContainer.GetRefPoseCompactArray());
+	}
+}
+
+
+void FAnimNode_KawaiiPhysics::ApplyLimitsDataAsset(const FBoneContainer& RequiredBones)
+{
+	SphericalLimitsData.Empty();
+	CapsuleLimitsData.Empty();
+	PlanarLimitsData.Empty();
+	if (LimitsDataAsset)
+	{
+		SphericalLimitsData = LimitsDataAsset->SphericalLimits;
+		CapsuleLimitsData = LimitsDataAsset->CapsuleLimits;
+		PlanarLimitsData = LimitsDataAsset->PlanarLimits;
+	}
+
+	for (auto& Sphere : SphericalLimitsData)
+	{
+		Sphere.DrivingBone.Initialize(RequiredBones);
+	}
+
+	for (auto& Capsule : CapsuleLimitsData)
+	{
+		Capsule.DrivingBone.Initialize(RequiredBones);
+	}
+	for (auto& Planer : PlanarLimitsData)
+	{
+		Planer.DrivingBone.Initialize(RequiredBones);
+	}
 }
 
 int FAnimNode_KawaiiPhysics::AddModifyBone(FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, 
@@ -219,7 +277,7 @@ int FAnimNode_KawaiiPhysics::AddModifyBone(FComponentSpacePoseContext& Output, c
 		// Add dummy modify bone
 		FKawaiiPhysicsModifyBone DummyModifyBone;
 		DummyModifyBone.bDummy = true;
-		DummyModifyBone.Location = NewModifyBone.Location + NewModifyBone.PrevRotation.GetForwardVector() * DummyBoneLength;
+		DummyModifyBone.Location = NewModifyBone.Location + GetBoneForwardVector(NewModifyBone.PrevRotation) * DummyBoneLength;
 		DummyModifyBone.PrevLocation = DummyModifyBone.Location;
 		DummyModifyBone.PoseLocation = DummyModifyBone.Location;
 		DummyModifyBone.PrevRotation = NewModifyBone.PrevRotation;
@@ -340,9 +398,9 @@ void FAnimNode_KawaiiPhysics::UpdatePhysicsSettingsOfModifyBones()
 
 DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_UpdateSphericalLimit"), STAT_KawaiiPhysics_UpdateSphericalLimit, STATGROUP_Anim);
 
-void FAnimNode_KawaiiPhysics::UpdateSphericalLimits(FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
+void FAnimNode_KawaiiPhysics::UpdateSphericalLimits(TArray<FSphericalLimit>& Limits, FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
 {
-	for (auto& Sphere : SphericalLimits)
+	for (auto& Sphere : Limits)
 	{
 		SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_UpdateSphericalLimit);
 
@@ -368,9 +426,9 @@ void FAnimNode_KawaiiPhysics::UpdateSphericalLimits(FComponentSpacePoseContext& 
 
 DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_UpdateCapsuleLimit"), STAT_KawaiiPhysics_UpdateCapsuleLimit, STATGROUP_Anim);
 
-void FAnimNode_KawaiiPhysics::UpdateCapsuleLimits(FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
+void FAnimNode_KawaiiPhysics::UpdateCapsuleLimits(TArray<FCapsuleLimit>& Limits, FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
 {
-	for (auto& Capsule : CapsuleLimits)
+	for (auto& Capsule : Limits)
 	{
 		SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_UpdateCapsuleLimit);
 
@@ -397,9 +455,9 @@ void FAnimNode_KawaiiPhysics::UpdateCapsuleLimits(FComponentSpacePoseContext& Ou
 
 DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_UpdatePlanerLimit"), STAT_KawaiiPhysics_UpdatePlanerLimit, STATGROUP_Anim);
 
-void FAnimNode_KawaiiPhysics::UpdatePlanerLimits(FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
+void FAnimNode_KawaiiPhysics::UpdatePlanerLimits(TArray<FPlanarLimit>& Limits, FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
 {
-	for (auto& Planar : PlanarLimits)
+	for (auto& Planar : Limits)
 	{
 		SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_UpdatePlanerLimit);
 
@@ -428,14 +486,14 @@ void FAnimNode_KawaiiPhysics::UpdatePlanerLimits(FComponentSpacePoseContext& Out
 	}
 }
 
-DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_SimulateModfyBones"), STAT_KawaiiPhysics_SimulateModfyBones, STATGROUP_Anim);
-DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_SimulateModfyBone"), STAT_KawaiiPhysics_SimulateModfyBone, STATGROUP_Anim);
+DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_SimulatemodifyBones"), STAT_KawaiiPhysics_SimulatemodifyBones, STATGROUP_Anim);
+DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_SimulatemodifyBone"), STAT_KawaiiPhysics_SimulatemodifyBone, STATGROUP_Anim);
 DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_AdjustBone"), STAT_KawaiiPhysics_AdjustBone, STATGROUP_Anim);
 DECLARE_CYCLE_STAT(TEXT("KawaiiPhysics_Wind"), STAT_KawaiiPhysics_Wind, STATGROUP_Anim);
 
-void FAnimNode_KawaiiPhysics::SimulateModfyBones(FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
+void FAnimNode_KawaiiPhysics::SimulateModifyBones(FComponentSpacePoseContext& Output, const FBoneContainer& BoneContainer, FTransform& ComponentTransform)
 {
-	SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_SimulateModfyBones);
+	SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_SimulatemodifyBones);
 
 	if (DeltaTime <= 0.0f)
 	{
@@ -453,9 +511,12 @@ void FAnimNode_KawaiiPhysics::SimulateModfyBones(FComponentSpacePoseContext& Out
 	FSceneInterface* Scene = World && World->Scene ? World->Scene : nullptr;
 	const float Exponent = TargetFramerate * DeltaTime;
 
+	//transform gravity to component space
+	FVector GravityCS = ComponentTransform.InverseTransformVector(Gravity);
+
 	for (int i = 0; i < ModifyBones.Num(); ++i)
 	{
-		SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_SimulateModfyBone);
+		SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_SimulatemodifyBone);
 
 		auto& Bone = ModifyBones[i];
 		if (Bone.BoneRef.BoneIndex < 0 && !Bone.bDummy)
@@ -508,11 +569,11 @@ void FAnimNode_KawaiiPhysics::SimulateModfyBones(FComponentSpacePoseContext& Out
 		// TODO:Migrate if there are more good method (Currently copying AnimDynamics implementation)
 		if (CVarEnableOldPhysicsMethodGrayity.GetValueOnAnyThread() == 0)
 		{
-			Bone.Location += 0.5 * Gravity * DeltaTime * DeltaTime;
+			Bone.Location += 0.5 * GravityCS * DeltaTime * DeltaTime;
 		}
 		else
 		{
-			Bone.Location += Gravity * DeltaTime;
+			Bone.Location += GravityCS * DeltaTime;
 		}
 		
 		// Pull to Pose Location
@@ -524,9 +585,12 @@ void FAnimNode_KawaiiPhysics::SimulateModfyBones(FComponentSpacePoseContext& Out
 			SCOPE_CYCLE_COUNTER(STAT_KawaiiPhysics_AdjustBone);
 
 			// Adjust by each collisions
-			AdjustBySphereCollision(Bone);
-			AdjustByCapsuleCollision(Bone);
-			AdjustByPlanerCollision(Bone);
+			AdjustBySphereCollision(Bone, SphericalLimits);
+			AdjustBySphereCollision(Bone, SphericalLimitsData);
+			AdjustByCapsuleCollision(Bone, CapsuleLimits);
+			AdjustByCapsuleCollision(Bone, CapsuleLimitsData);
+			AdjustByPlanerCollision(Bone, PlanarLimits);
+			AdjustByPlanerCollision(Bone, PlanarLimitsData);
 
 			// Adjust by angle limit
 			AdjustByAngleLimit(Output, BoneContainer, ComponentTransform, Bone, ParentBone);
@@ -542,9 +606,9 @@ void FAnimNode_KawaiiPhysics::SimulateModfyBones(FComponentSpacePoseContext& Out
 	DeltaTimeOld = DeltaTime;
 }
 
-void FAnimNode_KawaiiPhysics::AdjustBySphereCollision(FKawaiiPhysicsModifyBone& Bone)
+void FAnimNode_KawaiiPhysics::AdjustBySphereCollision(FKawaiiPhysicsModifyBone& Bone, TArray<FSphericalLimit>& Limits)
 {
-	for (auto& Sphere : SphericalLimits)
+	for (auto& Sphere : Limits)
 	{
 		if (Sphere.Radius <= 0.0f)
 		{
@@ -585,9 +649,9 @@ void FAnimNode_KawaiiPhysics::AdjustBySphereCollision(FKawaiiPhysicsModifyBone& 
 	}
 }
 
-void FAnimNode_KawaiiPhysics::AdjustByCapsuleCollision(FKawaiiPhysicsModifyBone& Bone)
+void FAnimNode_KawaiiPhysics::AdjustByCapsuleCollision(FKawaiiPhysicsModifyBone& Bone, TArray<FCapsuleLimit>& Limits)
 {
-	for (auto& Capsule : CapsuleLimits)
+	for (auto& Capsule : Limits)
 	{
 		if (Capsule.Radius <= 0 || Capsule.Length <= 0)
 		{
@@ -607,9 +671,9 @@ void FAnimNode_KawaiiPhysics::AdjustByCapsuleCollision(FKawaiiPhysicsModifyBone&
 	}
 }
 
-void FAnimNode_KawaiiPhysics::AdjustByPlanerCollision(FKawaiiPhysicsModifyBone& Bone)
+void FAnimNode_KawaiiPhysics::AdjustByPlanerCollision(FKawaiiPhysicsModifyBone& Bone, TArray<FPlanarLimit>& Limits)
 {
-	for (auto& Planar : PlanarLimits)
+	for (auto& Planar : Limits)
 	{
 		FVector PointOnPlane = FVector::PointPlaneProject(Bone.Location, Planar.Plane);
 		float DistSquared = (Bone.Location - PointOnPlane).SizeSquared();
@@ -689,6 +753,12 @@ void FAnimNode_KawaiiPhysics::ApplySimuateResult(FComponentSpacePoseContext& Out
 				if (PoseVector.GetSafeNormal() == SimulateVector.GetSafeNormal())
 				{
 					continue;
+				}
+
+				if (BoneForwardAxis == EBoneForwardAxis::X_Negative || BoneForwardAxis == EBoneForwardAxis::Y_Negative || BoneForwardAxis == EBoneForwardAxis::Z_Negative)
+				{
+					PoseVector *= -1;
+					SimulateVector *= -1;
 				}
 
 				FQuat SimulateRotation = FQuat::FindBetweenVectors(PoseVector, SimulateVector) * ParentBone.PoseRotation;
